@@ -1,0 +1,26 @@
+name: Build WSPlayer
+
+on: [push, workflow_dispatch]
+
+jobs:
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install pyinstaller pywebview requests
+
+      - name: Compilar
+        run: pyinstaller --onedir --windowed --name WSPlayer wsplayer.py
+
+      - name: Subir ejecutable
+        uses: actions/upload-artifact@v4
+        with:
+          name: WSPlayer-Windows
+          path: dist/WSPlayer/
