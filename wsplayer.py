@@ -1,4 +1,4 @@
-﻿# pip install requests cryptography
+# pip install requests cryptography
 import sys, os, re, secrets, mimetypes, threading, requests, json, webbrowser, ssl, tempfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import quote, urlparse
@@ -131,6 +131,7 @@ const fmt = s => { s = isFinite(s) ? Math.max(0, Math.floor(s)) : 0;
   return String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0'); };
 let dragging=false, dur=0, names=[], currentName='', toastT;
 const eq=[0,0,0,0,0]; let wantRate=1, wantMuted=false;
+let isShuffle = false, originalPlaylist = [], originalNames = [];
 $('ver').textContent = 'QPlay.js v' + QPlay.version;
 
 function msg(t, ok){ const m=$('toast'); m.textContent=t; m.className=ok?'ok':'err'; m.style.display='block';
@@ -147,11 +148,15 @@ function applyVolume(){
 function nudgeVol(d){ const v=$('vol'); v.value=Math.max(0,Math.min(300,+v.value+d)); applyVolume(); }
 $('vol').oninput = applyVolume;
 $('bmute').onclick = () => {
-  if (isMedia()) wantMuted = q.toggleMute(); else wantMuted = !wantMuted;
+  if (isMedia()) {
+    wantMuted = !q.activeElement.muted;
+    q.activeElement.muted = wantMuted;
+  } else {
+    wantMuted = !wantMuted;
+  }
   $('bmute').textContent = wantMuted ? '🔇' : '🔊';
 };
 
-// QPlay crea un elemento nuevo en cada load: se reaplica el estado
 function applyState(){
   if (!isMedia()) return;
   applyVolume();
@@ -161,10 +166,17 @@ function applyState(){
 }
 
 // ---------- Reproducción ----------
-function togglePlay(){ if(!isMedia()) return; if(q.activeElement.paused) Promise.resolve(q.play()).catch(quiet); else q.pause(); }
+function togglePlay(){
+  if (!isMedia()) return;
+  if (q.activeElement.paused) {
+    Promise.resolve(q.play()).catch(quiet);
+  } else {
+    q.pause();
+  }
+}
 $('bplay').onclick = togglePlay;
-$('brw').onclick = () => q.rewind(10);
-$('bfw').onclick = () => q.forward(10);
+$('brw').onclick = () => q.seek((q.activeElement?.currentTime || 0) - 10);
+$('bfw').onclick = () => q.seek((q.activeElement?.currentTime || 0) + 10);
 $('bnext').onclick = $('bnext2').onclick = () => q.next().catch(quiet);
 $('bprev').onclick = $('bprev2').onclick = () => q.previous().catch(quiet);
 
@@ -192,8 +204,8 @@ q.on('recordingstop',  () => { $('brec').textContent='⏺ Grabar'; $('brec').cla
 
 // ---------- Cargar ----------
 function loadSingle(u, name){
-  q.playlist = []; q.currentIndex = -1; names = [];
-  currentName = name || labelFromUrl(u);
+  q.playlist = [u]; originalPlaylist = [u]; q.currentIndex = 0; 
+  names = [name || labelFromUrl(u)]; originalNames = [...names];
   renderList(); q.load(u).catch(quiet);
 }
 async function callApi(endpoint, body){
@@ -213,8 +225,9 @@ $('bfile').onclick = () => {
     if (!files.length) return;
     const urls = files.map(f => URL.createObjectURL(f));
     const fnames = files.map(f => f.name);
+    originalPlaylist = [...urls]; originalNames = [...fnames];
     if (files.length === 1) { loadSingle(urls[0], fnames[0]); return; }
-    names = fnames; renderList();
+    names = [...fnames]; q.playlist = [...urls]; renderList();
     q.loadPlaylist(urls, 0).catch(quiet);
   };
   inp.click();
@@ -224,21 +237,69 @@ $('blink').onclick = () => { const u=getLink(); if(u) loadSingle(u); };
 $('url').addEventListener('keydown', e => { if (e.key==='Enter') $('blink').click(); });
 $('badd').onclick = () => {
   const u=getLink(); if(!u) return;
-  q.playlist.push(u); names.push(labelFromUrl(u)); renderList();
+  q.playlist.push(u); originalPlaylist.push(u);
+  const n = labelFromUrl(u);
+  names.push(n); originalNames.push(n);
+  renderList();
   if (!q.activeElement) q.playIndex(q.playlist.length-1).catch(quiet);
 };
 
-// ---------- Lista ----------
+// ---------- Lista, Aleatorio y Repetición corregidos ----------
 function renderList(){
   const ul=$('list'); ul.innerHTML='';
-  names.forEach((n,i)=>{ const li=document.createElement('li'); li.textContent=(i+1)+'. '+n;
-    if (i===q.currentIndex) li.className='cur'; li.onclick=()=>q.playIndex(i).catch(quiet); ul.appendChild(li); });
+  names.forEach((n,i)=>{ 
+    const li=document.createElement('li'); 
+    li.textContent=(i+1)+'. '+n;
+    if (i===q.currentIndex) li.className='cur'; 
+    li.onclick=()=>q.playIndex(i).catch(quiet); 
+    ul.appendChild(li); 
+  });
   $('cnt').textContent = names.length ? names.length + ' elementos' : 'Lista vacía';
 }
-$('bshuf').onclick = () => { const on=q.toggleShuffle(); $('bshuf').classList.toggle('act', on); };
-$('brep').onclick = () => { const m=q.setRepeatMode();
-  $('brep').textContent = '🔁 ' + ({off:'No repetir', all:'Todo', one:'Uno'}[m]); $('brep').classList.toggle('act', m!=='off'); };
-$('bclear').onclick = () => { q.destroy(); q.playlist=[]; q.currentIndex=-1; names=[]; currentName=''; $('title').textContent=''; renderList(); };
+
+$('bshuf').onclick = () => {
+  isShuffle = !isShuffle;
+  $('bshuf').classList.toggle('act', isShuffle);
+  if (isShuffle && q.playlist.length > 1) {
+    const currentItem = q.playlist[q.currentIndex];
+    const currentName = names[q.currentIndex];
+    
+    // Crear copia mezclada manteniendo el actual sonando si es posible
+    let indices = q.playlist.map((_, i) => i);
+    for (let i = indices.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    q.playlist = indices.map(i => originalPlaylist[i]);
+    names = indices.map(i => originalNames[i]);
+    if (currentItem) {
+      q.currentIndex = q.playlist.indexOf(currentItem);
+    }
+  } else {
+    q.playlist = [...originalPlaylist];
+    names = [...originalNames];
+    if (q.activeElement) {
+      const currentItem = q.playlist[q.currentIndex];
+      q.currentIndex = originalPlaylist.indexOf(currentItem);
+    }
+  }
+  renderList();
+};
+
+const repeatModes = ['off', 'all', 'one'];
+const repeatLabels = { off: '🔁 No repetir', all: '🔁 Repetir todo', one: '🔂 Repetir uno' };
+$('brep').onclick = () => {
+  let idx = (repeatModes.indexOf(q.repeatMode) + 1) % repeatModes.length;
+  q.repeatMode = repeatModes[idx];
+  $('brep').textContent = repeatLabels[q.repeatMode];
+  $('brep').classList.toggle('act', q.repeatMode !== 'off');
+};
+
+$('bclear').onclick = () => { 
+  q.destroy(); 
+  q.playlist=[]; originalPlaylist=[]; names=[]; originalNames=[]; q.currentIndex=-1; currentName=''; 
+  $('title').textContent=''; renderList(); 
+};
 
 // ---------- Ecualizador ----------
 ['60 Hz','230 Hz','910 Hz','3.6 kHz','14 kHz'].forEach((b,i)=>{
@@ -276,6 +337,7 @@ $('brec').onclick = async () => {
 };
 $('bpip').onclick = async () => { const on = await q.togglePiP(); msg(on ? 'Picture-in-Picture activado' : 'PiP desactivado o no disponible', on); };
 $('bfs').onclick = () => callApi('toggle_fullscreen');
+
 $('bsub').onclick = () => {
   const inp = document.createElement('input');
   inp.type = 'file';
@@ -287,9 +349,22 @@ $('bsub').onclick = () => {
   };
   inp.click();
 };
+
 $('bsubu').onclick = () => {
-  const u=$('suburl').value.trim(); if(!u) return msg('Pega la URL del subtítulo.', false);
-  q.addSubtitleTrack(u, labelFromUrl(u), $('sublang').value.trim() || 'es');
+  const u = $('suburl').value.trim(); 
+  if(!u) return msg('Pega la URL del subtítulo.', false);
+  if (q.activeElement instanceof HTMLVideoElement) {
+    const track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.label = labelFromUrl(u);
+    track.srclang = $('sublang').value.trim() || 'es';
+    track.src = u;
+    track.default = true;
+    q.activeElement.appendChild(track);
+    msg('Subtítulo añadido por URL.', true);
+  } else {
+    msg('No hay un video activo para añadir subtítulos.', false);
+  }
 };
 
 // ---------- Caché QPlay ----------
@@ -324,8 +399,8 @@ document.addEventListener('keydown', e => {
   const t=e.target; if (t.tagName==='INPUT' && t.type==='text') return;
   const k=e.key.toLowerCase(); let h=true;
   if (k===' ') togglePlay();
-  else if (k==='arrowright') q.forward(10);
-  else if (k==='arrowleft') q.rewind(10);
+  else if (k==='arrowright') q.seek((q.activeElement?.currentTime || 0) + 10);
+  else if (k==='arrowleft') q.seek((q.activeElement?.currentTime || 0) - 10);
   else if (k==='arrowup') nudgeVol(5);
   else if (k==='arrowdown') nudgeVol(-5);
   else if (k==='m') $('bmute').click();
@@ -340,18 +415,16 @@ document.addEventListener('keydown', e => {
 
 class Server(BaseHTTPRequestHandler):
     js    = ""
-    media = {}   # id -> ruta de archivo local
-    saves = {}   # token -> ruta de destino (un solo uso)
-    api   = None # instancia de API
+    media = {}
+    saves = {}
+    api   = None
 
     @classmethod
     def load_cdn(cls):
-        # 1. Intentar descargar desde CDN
         try:
             res = requests.get(CDN, timeout=15)
             res.raise_for_status()
             cls.js = res.text
-            # Guardar en caché automáticamente
             try:
                 with open(CACHE_FILE, "w", encoding="utf-8") as f:
                     f.write(cls.js)
@@ -360,7 +433,6 @@ class Server(BaseHTTPRequestHandler):
             return
         except Exception:
             pass
-        # 2. Sin internet: usar caché local si existe
         if os.path.isfile(CACHE_FILE):
             try:
                 with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -368,11 +440,10 @@ class Server(BaseHTTPRequestHandler):
                 return
             except Exception:
                 pass
-        # 3. Sin internet y sin caché: error claro
         sys.exit(
             "No se pudo cargar QPlay.js.\n"
-            "Conectate a internet al menos una vez para almacenar el caché,\n"
-            "o usá el botón 'Almacenar QPlay en caché' con conexión disponible."
+            "Conéctate a internet al menos una vez para almacenar el caché,\n"
+            "o usa el botón 'Almacenar QPlay en caché' con conexión disponible."
         )
 
     def cors(self):
@@ -408,7 +479,7 @@ class Server(BaseHTTPRequestHandler):
             elif path in ("/", "/index.html"):
                 self.send_bytes("text/html; charset=utf-8", HTML.encode("utf-8"))
             elif path.startswith("/media/"):
-                parts = path.split("/")  # ['', 'media', id, nombre]
+                parts = path.split("/")
                 fp = Server.media.get(parts[2]) if len(parts) >= 3 else None
                 if fp and os.path.isfile(fp):
                     self.serve_media(fp)
@@ -421,7 +492,6 @@ class Server(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        # Endpoints de API
         if path == "/api/open_files":
             result = Server.api.open_files() if Server.api else []
             self.send_bytes("application/json", json.dumps({"result": result}).encode())
@@ -518,64 +588,25 @@ class Server(BaseHTTPRequestHandler):
         pass
 
 
-def _dlg(kind):
-    return kind  # ya no se usa webview, se pasa directo a filedialog
-
-
-def _ass_time(s):
-    h, m, rest = s.strip().split(":")
-    sec, _, cs = rest.partition(".")
-    return f"{int(h):02d}:{m}:{sec}.{cs.ljust(3, '0')[:3]}"
-
-
-def ass_to_vtt(text):
-    cols, in_ev, out = None, False, ["WEBVTT", ""]
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("["):
-            in_ev = s.lower() == "[events]"
-            continue
-        if not in_ev:
-            continue
-        low = s.lower()
-        if low.startswith("format:"):
-            cols = [c.strip().lower() for c in s[7:].split(",")]
-        elif low.startswith("dialogue:") and cols:
-            parts = s[9:].lstrip().split(",", len(cols) - 1)
-            try:
-                st = _ass_time(parts[cols.index("start")])
-                en = _ass_time(parts[cols.index("end")])
-                txt = re.sub(r"\{[^}]*\}", "", parts[cols.index("text")])
-                txt = txt.replace("\\N", "\n").replace("\\n", "\n")
-            except (ValueError, IndexError):
-                continue
-            out += [f"{st} --> {en}", txt, ""]
-    return "\n".join(out)
-
-
 class API:
     def __init__(self, port):
         self.port = port
 
     def open_files(self):
-        # Manejado por el navegador via <input type="file"> en el HTML
         return []
 
     def pick_subtitle(self):
-        # Manejado por el navegador via <input type="file"> en el HTML
         return None
 
     def pick_save(self, suggested="archivo"):
-        # El navegador descarga directamente con <a download>
         token = secrets.token_urlsafe(12)
         Server.saves[token] = os.path.join(tempfile.gettempdir(), suggested)
         return token
 
     def toggle_fullscreen(self):
-        pass  # el navegador maneja su propio fullscreen
+        pass
 
     def cache_qplay(self):
-        """Descarga QPlay.js desde el CDN y lo guarda en caché."""
         try:
             res = requests.get(CDN, timeout=15)
             res.raise_for_status()
@@ -587,7 +618,6 @@ class API:
             raise Exception(f"No se pudo descargar QPlay.js: {e}")
 
     def refresh_cache(self):
-        """Borra la caché actual y descarga la versión más reciente."""
         try:
             if os.path.isfile(CACHE_FILE):
                 os.remove(CACHE_FILE)
@@ -601,7 +631,6 @@ class API:
             raise Exception(f"No se pudo actualizar la caché: {e}")
 
     def cache_status(self):
-        """Devuelve el estado actual de la caché."""
         if os.path.isfile(CACHE_FILE):
             size = os.path.getsize(CACHE_FILE)
             mtime = os.path.getmtime(CACHE_FILE)
@@ -612,7 +641,6 @@ class API:
 
 
 def _gen_cert():
-    """Genera un certificado SSL autofirmado para localhost."""
     try:
         from cryptography import x509
         from cryptography.x509.oid import NameOID
@@ -628,15 +656,14 @@ def _gen_cert():
             .issuer_name(name)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
-            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
             .add_extension(x509.SubjectAlternativeName([
                 x509.DNSName(u"localhost"),
                 x509.IPAddress(__import__("ipaddress").IPv4Address("127.0.0.1"))
             ]), critical=False)
             .sign(key, hashes.SHA256())
         )
-        # Guardar en archivos temporales
         tmp = tempfile.mkdtemp()
         cert_file = os.path.join(tmp, "wsplayer.crt")
         key_file  = os.path.join(tmp, "wsplayer.key")
@@ -659,7 +686,6 @@ if __name__ == "__main__":
     port = httpd.server_address[1]
     Server.api = API(port)
 
-    # Intentar HTTPS con certificado autofirmado
     cert_file, key_file = _gen_cert()
     if cert_file:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -678,7 +704,6 @@ if __name__ == "__main__":
     print(f"WSPlayer corriendo en {url}")
     webbrowser.open(url)
 
-    # Mantener el proceso vivo
     try:
         input("WSPlayer corriendo. Presioná Enter para cerrar...\n")
     except KeyboardInterrupt:
