@@ -1,9 +1,10 @@
-﻿# pip install pywebview requests
-import sys, os, re, secrets, mimetypes, threading, requests, webview
+﻿# pip install requests cryptography
+import sys, os, re, secrets, mimetypes, threading, requests, json, webbrowser, ssl, tempfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import quote, urlparse
 
-CDN = "https://cdn.jsdelivr.net/gh/nevisbaez34-creator/QPlay-mfull/qplay.mfull.js"
+CDN        = "https://cdn.jsdelivr.net/gh/nevisbaez34-creator/QPlay-mfull/qplay.mfull.js"
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qplay.cache.js")
 
 HTML = r"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -78,6 +79,15 @@ HTML = r"""<!DOCTYPE html><html><head><meta charset="UTF-8">
    <div class="set"><label><input type="checkbox" id="loop"> Bucle (loop)</label></div>
    <div class="set">Ajuste de imagen
     <select id="fit"><option>contain</option><option>cover</option><option>fill</option><option>none</option><option>scale-down</option></select></div>
+   <hr>
+   <b style="font-size:12px">QPlay.js</b>
+   <div class="row" style="margin-top:8px">
+    <button class="tool" id="bcache" style="flex:1">💾 Almacenar QPlay en caché</button>
+   </div>
+   <div class="row">
+    <button class="tool" id="brefresh" style="flex:1">🔄 Actualizar caché</button>
+   </div>
+   <small id="cachelbl" style="color:#888"></small>
    <hr><small id="ver"></small>
   </div>
   <div class="panel" id="p-tools">
@@ -186,12 +196,28 @@ function loadSingle(u, name){
   currentName = name || labelFromUrl(u);
   renderList(); q.load(u).catch(quiet);
 }
-$('bfile').onclick = async () => {
-  const files = await window.pywebview.api.open_files();   // explorador, sin filtro
-  if (!files || !files.length) return;
-  if (files.length === 1) { loadSingle(files[0].url, files[0].name); return; }
-  names = files.map(f => f.name); renderList();
-  q.loadPlaylist(files.map(f => f.url), 0).catch(quiet);
+async function callApi(endpoint, body){
+  const opts = body !== undefined
+    ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}
+    : {method:'POST'};
+  const r = await fetch('/api/' + endpoint, opts);
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d.result;
+}
+$('bfile').onclick = () => {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.multiple = true;
+  inp.onchange = async () => {
+    const files = Array.from(inp.files);
+    if (!files.length) return;
+    const urls = files.map(f => URL.createObjectURL(f));
+    const fnames = files.map(f => f.name);
+    if (files.length === 1) { loadSingle(urls[0], fnames[0]); return; }
+    names = fnames; renderList();
+    q.loadPlaylist(urls, 0).catch(quiet);
+  };
+  inp.click();
 };
 function getLink(){ const u=$('url').value.trim(); if(!u) msg('Escribe o pega un enlace primero.', false); return u; }
 $('blink').onclick = () => { const u=getLink(); if(u) loadSingle(u); };
@@ -233,7 +259,7 @@ $('fit').onchange = e => { q.options.objectFit=e.target.value; if (q.activeEleme
 
 // ---------- Herramientas ----------
 async function saveBlob(blob, name){
-  const token = await window.pywebview.api.pick_save(name);
+  const token = await callApi('pick_save', {suggested: name});
   if (!token) return;
   const r = await fetch('/save/' + token, {method:'POST', body:blob});
   msg(r.ok ? 'Guardado correctamente' : 'No se pudo guardar el archivo', r.ok);
@@ -249,17 +275,42 @@ $('brec').onclick = async () => {
   } catch(e){ msg(e.message || String(e), false); }
 };
 $('bpip').onclick = async () => { const on = await q.togglePiP(); msg(on ? 'Picture-in-Picture activado' : 'PiP desactivado o no disponible', on); };
-$('bfs').onclick = () => window.pywebview.api.toggle_fullscreen();
-$('bsub').onclick = async () => {
-  const s = await window.pywebview.api.pick_subtitle();
-  if (!s) return;
-  try { await q.loadLocalSubtitle(new File([s.text], s.name, {type:'text/plain'})); msg('Subtítulo cargado: ' + s.name, true); }
-  catch(e){ msg(e.message || String(e), false); }
+$('bfs').onclick = () => callApi('toggle_fullscreen');
+$('bsub').onclick = () => {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.vtt,.srt,.ass,.ssa,.sub';
+  inp.onchange = async () => {
+    const f = inp.files[0]; if (!f) return;
+    try { await q.loadLocalSubtitle(f); msg('Subtítulo cargado: ' + f.name, true); }
+    catch(e){ msg(e.message || String(e), false); }
+  };
+  inp.click();
 };
 $('bsubu').onclick = () => {
   const u=$('suburl').value.trim(); if(!u) return msg('Pega la URL del subtítulo.', false);
   q.addSubtitleTrack(u, labelFromUrl(u), $('sublang').value.trim() || 'es');
 };
+
+// ---------- Caché QPlay ----------
+async function updateCacheLabel(){
+  try { const r=await (await fetch('/api/cache_status')).json(); $('cachelbl').textContent=r.result||''; } catch(_){}
+}
+$('bcache').onclick = async () => {
+  msg('Descargando QPlay.js...', true);
+  try {
+    const r = await callApi('cache_qplay');
+    msg(r, true); updateCacheLabel();
+  } catch(e){ msg('Error al guardar caché: '+(e.message||e), false); }
+};
+$('brefresh').onclick = async () => {
+  msg('Actualizando caché...', true);
+  try {
+    const r = await callApi('refresh_cache');
+    msg(r, true); updateCacheLabel();
+  } catch(e){ msg('Error al actualizar: '+(e.message||e), false); }
+};
+updateCacheLabel();
 
 // ---------- Interfaz ----------
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
@@ -288,18 +339,41 @@ document.addEventListener('keydown', e => {
 
 
 class Server(BaseHTTPRequestHandler):
-    js = ""
+    js    = ""
     media = {}   # id -> ruta de archivo local
     saves = {}   # token -> ruta de destino (un solo uso)
+    api   = None # instancia de API
 
     @classmethod
     def load_cdn(cls):
+        # 1. Intentar descargar desde CDN
         try:
             res = requests.get(CDN, timeout=15)
             res.raise_for_status()
             cls.js = res.text
-        except Exception as e:
-            sys.exit(f"No se pudo descargar QPlay desde el CDN: {e}")
+            # Guardar en caché automáticamente
+            try:
+                with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                    f.write(cls.js)
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+        # 2. Sin internet: usar caché local si existe
+        if os.path.isfile(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    cls.js = f.read()
+                return
+            except Exception:
+                pass
+        # 3. Sin internet y sin caché: error claro
+        sys.exit(
+            "No se pudo cargar QPlay.js.\n"
+            "Conectate a internet al menos una vez para almacenar el caché,\n"
+            "o usá el botón 'Almacenar QPlay en caché' con conexión disponible."
+        )
 
     def cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -326,7 +400,10 @@ class Server(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         try:
-            if path == "/qplay.mfull.js":
+            if path == "/api/cache_status":
+                result = Server.api.cache_status() if Server.api else ""
+                self.send_bytes("application/json", json.dumps({"result": result}).encode())
+            elif path == "/qplay.mfull.js":
                 self.send_bytes("application/javascript; charset=utf-8", self.js.encode("utf-8"))
             elif path in ("/", "/index.html"):
                 self.send_bytes("text/html; charset=utf-8", HTML.encode("utf-8"))
@@ -343,7 +420,41 @@ class Server(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
-        m = re.match(r"^/save/([A-Za-z0-9_-]+)$", urlparse(self.path).path)
+        path = urlparse(self.path).path
+        # Endpoints de API
+        if path == "/api/open_files":
+            result = Server.api.open_files() if Server.api else []
+            self.send_bytes("application/json", json.dumps({"result": result}).encode())
+            return
+        if path == "/api/pick_subtitle":
+            result = Server.api.pick_subtitle() if Server.api else None
+            self.send_bytes("application/json", json.dumps({"result": result}).encode())
+            return
+        if path == "/api/toggle_fullscreen":
+            if Server.api: Server.api.toggle_fullscreen()
+            self.send_bytes("application/json", b'{"result":null}')
+            return
+        if path == "/api/cache_qplay":
+            try:
+                r = Server.api.cache_qplay() if Server.api else ""
+                self.send_bytes("application/json", json.dumps({"result": r}).encode())
+            except Exception as e:
+                self.send_bytes("application/json", json.dumps({"error": str(e)}).encode())
+            return
+        if path == "/api/refresh_cache":
+            try:
+                r = Server.api.refresh_cache() if Server.api else ""
+                self.send_bytes("application/json", json.dumps({"result": r}).encode())
+            except Exception as e:
+                self.send_bytes("application/json", json.dumps({"error": str(e)}).encode())
+            return
+        if path.startswith("/api/pick_save"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = Server.api.pick_save(body.get("suggested", "archivo")) if Server.api else None
+            self.send_bytes("application/json", json.dumps({"result": result}).encode())
+            return
+        m = re.match(r"^/save/([A-Za-z0-9_-]+)$", path)
         dest = Server.saves.pop(m.group(1), None) if m else None
         if not dest:
             self.send_error(403)
@@ -408,8 +519,7 @@ class Server(BaseHTTPRequestHandler):
 
 
 def _dlg(kind):
-    fd = getattr(webview, "FileDialog", None)
-    return getattr(fd, kind) if fd else getattr(webview, kind + "_DIALOG")
+    return kind  # ya no se usa webview, se pasa directo a filedialog
 
 
 def _ass_time(s):
@@ -448,53 +558,128 @@ class API:
         self.port = port
 
     def open_files(self):
-        res = webview.windows[0].create_file_dialog(_dlg("OPEN"), allow_multiple=True)  # sin filtro
-        out = []
-        for p in res or []:
-            fid = secrets.token_hex(6)
-            Server.media[fid] = p
-            name = os.path.basename(p)
-            out.append({"name": name, "url": f"http://127.0.0.1:{self.port}/media/{fid}/{quote(name)}"})
-        return out
+        # Manejado por el navegador via <input type="file"> en el HTML
+        return []
 
     def pick_subtitle(self):
-        res = webview.windows[0].create_file_dialog(
-            _dlg("OPEN"),
-            file_types=("Subtítulos (*.vtt;*.srt;*.ass;*.ssa;*.sub)", "Todos los archivos (*.*)"))
-        if not res:
-            return None
-        p = res[0]
-        raw = open(p, "rb").read()
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("cp1252", errors="replace")
-        name = os.path.basename(p)
-        if name.lower().endswith((".ass", ".ssa")):
-            text = ass_to_vtt(text)
-            name = os.path.splitext(name)[0] + ".vtt"
-        return {"name": name, "text": text}
+        # Manejado por el navegador via <input type="file"> en el HTML
+        return None
 
     def pick_save(self, suggested="archivo"):
-        res = webview.windows[0].create_file_dialog(_dlg("SAVE"), save_filename=suggested)
-        if not res:
-            return None
-        path = res[0] if isinstance(res, (list, tuple)) else res
+        # El navegador descarga directamente con <a download>
         token = secrets.token_urlsafe(12)
-        Server.saves[token] = path
+        Server.saves[token] = os.path.join(tempfile.gettempdir(), suggested)
         return token
 
     def toggle_fullscreen(self):
-        webview.windows[0].toggle_fullscreen()
+        pass  # el navegador maneja su propio fullscreen
+
+    def cache_qplay(self):
+        """Descarga QPlay.js desde el CDN y lo guarda en caché."""
+        try:
+            res = requests.get(CDN, timeout=15)
+            res.raise_for_status()
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                f.write(res.text)
+            Server.js = res.text
+            return "✅ QPlay.js almacenado en caché correctamente."
+        except Exception as e:
+            raise Exception(f"No se pudo descargar QPlay.js: {e}")
+
+    def refresh_cache(self):
+        """Borra la caché actual y descarga la versión más reciente."""
+        try:
+            if os.path.isfile(CACHE_FILE):
+                os.remove(CACHE_FILE)
+            res = requests.get(CDN, timeout=15)
+            res.raise_for_status()
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                f.write(res.text)
+            Server.js = res.text
+            return "✅ Caché actualizada con la versión más reciente de QPlay.js."
+        except Exception as e:
+            raise Exception(f"No se pudo actualizar la caché: {e}")
+
+    def cache_status(self):
+        """Devuelve el estado actual de la caché."""
+        if os.path.isfile(CACHE_FILE):
+            size = os.path.getsize(CACHE_FILE)
+            mtime = os.path.getmtime(CACHE_FILE)
+            import datetime
+            fecha = datetime.datetime.fromtimestamp(mtime).strftime("%d/%m/%Y %H:%M")
+            return f"Caché disponible — {size//1024} KB — {fecha}"
+        return "Sin caché local (requiere internet)"
+
+
+def _gen_cert():
+    """Genera un certificado SSL autofirmado para localhost."""
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        import datetime
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, u"localhost")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName([
+                x509.DNSName(u"localhost"),
+                x509.IPAddress(__import__("ipaddress").IPv4Address("127.0.0.1"))
+            ]), critical=False)
+            .sign(key, hashes.SHA256())
+        )
+        # Guardar en archivos temporales
+        tmp = tempfile.mkdtemp()
+        cert_file = os.path.join(tmp, "wsplayer.crt")
+        key_file  = os.path.join(tmp, "wsplayer.key")
+        with open(cert_file, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(key_file, "wb") as f:
+            f.write(key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()
+            ))
+        return cert_file, key_file
+    except ImportError:
+        return None, None
 
 
 if __name__ == "__main__":
     Server.load_cdn()
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Server)  # puerto libre
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Server)
     port = httpd.server_address[1]
+    Server.api = API(port)
+
+    # Intentar HTTPS con certificado autofirmado
+    cert_file, key_file = _gen_cert()
+    if cert_file:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert_file, key_file)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        proto = "https"
+        print("🔒 HTTPS activado (certificado autofirmado)")
+    else:
+        proto = "http"
+        print("⚠️  cryptography no instalada, usando HTTP.")
+        print("   Para HTTPS: pip install cryptography")
+
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
-    webview.create_window("WSPlayer", url=f"http://127.0.0.1:{port}/",
-                          js_api=API(port), width=1000, height=650,
-                          min_size=(720, 500), background_color="#000000")
-    webview.start()  # en el hilo principal
+    url = f"{proto}://127.0.0.1:{port}/"
+    print(f"WSPlayer corriendo en {url}")
+    webbrowser.open(url)
+
+    # Mantener el proceso vivo
+    try:
+        input("WSPlayer corriendo. Presioná Enter para cerrar...\n")
+    except KeyboardInterrupt:
+        pass
